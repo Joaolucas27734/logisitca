@@ -1,0 +1,50 @@
+# .github/workflows/rastreamento.yml
+
+name: Atualizar Rastreios
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types:
+      - rodar-rastreamento
+
+jobs:
+  rastrear:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar Google Chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Instalar dependências
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.tracking.txt
+
+      # ===============================
+      # 🔵 FASE 1 — LIMPEZA (EXECUTA)
+      # ===============================
+      - name: Mover pedidos encerrados
+        env:
+          GCP_SERVICE_ACCOUNT_BASE64: ${{ secrets.CREDENTIALS_BASE64 }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        run: |
+          python tracking/mover_encerrados.py
+
+      # ===============================
+      # 🟢 FASE 2 — RASTREAMENTO (DECIDE)
+      # ===============================
+      - name: Atualizar rastreios ativos
+        env:
+          GCP_SERVICE_ACCOUNT_BASE64: ${{ secrets.CREDENTIALS_BASE64 }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        run: |
+          python tracking/rastreamento.py
