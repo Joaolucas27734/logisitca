@@ -1,0 +1,7 @@
+# requirements.tracking.txt
+
+selenium
+webdriver-manager
+gspread
+oauth2client
+requests
