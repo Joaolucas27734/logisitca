@@ -1,5 +1,6 @@
 # services/shopify.py
 
+import time
 import requests
 from typing import Optional
 from services.config import get_secret
@@ -29,7 +30,7 @@ def _get_config():
     headers = {
         "X-Shopify-Access-Token": access_token,
         "Content-Type": "application/json",
-        "Accept": "application/json",
+        "Accept": "application/graphql-response+json",
     }
 
     return base_url, headers
@@ -95,21 +96,47 @@ def create_fulfillment(
     session = _get_session()
     base_url, _ = _get_config()
 
+    manual_location_id = get_secret(["shopify", "manual_location_id"])
+    if not manual_location_id:
+        raise RuntimeError("SHOPIFY manual_location_id não configurado.")
+
     # 1️⃣ Buscar fulfillment_orders
     f_orders_url = f"{base_url}/orders/{order_id}/fulfillment_orders.json"
     resp = session.get(f_orders_url, timeout=30)
     resp.raise_for_status()
 
     fulfillment_orders = resp.json().get("fulfillment_orders", [])
+
+    # 🔒 usar SOMENTE fulfillment_orders OPEN
+    fulfillment_orders = [
+        f for f in fulfillment_orders
+        if f.get("status") == "open"
+    ]
+
     if not fulfillment_orders:
         raise RuntimeError(
-            f"Nenhum fulfillment_order encontrado para o pedido {order_id}"
+            f"Nenhum fulfillment_order OPEN disponível para o pedido {order_id}"
         )
 
-    # 2️⃣ Criar fulfillment
+    # 2️⃣ Para cada fulfillment_order OPEN
     for f_order in fulfillment_orders:
         fulfillment_order_id = f_order["id"]
 
+        # 🔁 MOVER SEMPRE para location manual
+        move_url = (
+            f"{base_url}/fulfillment_orders/"
+            f"{fulfillment_order_id}/move.json"
+        )
+
+        move_payload = {
+            "fulfillment_order": {
+                "new_location_id": manual_location_id
+            }
+        }
+
+        session.post(move_url, json=move_payload, timeout=30)
+
+        # 3️⃣ Criar fulfillment
         payload = {
             "fulfillment": {
                 "line_items_by_fulfillment_order": [
@@ -128,25 +155,6 @@ def create_fulfillment(
         url = f"{base_url}/fulfillments.json"
         result = session.post(url, json=payload, timeout=30)
 
-        # 3️⃣ Fallback 422 (DSers / location)
-        if result.status_code == 422:
-            location_id = f_order.get("assigned_location_id")
-            if location_id:
-                move_url = (
-                    f"{base_url}/fulfillment_orders/"
-                    f"{fulfillment_order_id}/move.json"
-                )
-                move_payload = {
-                    "fulfillment_order": {"new_location_id": location_id}
-                }
-
-                move_resp = session.post(
-                    move_url, json=move_payload, timeout=30
-                )
-
-                if move_resp.status_code in (200, 201):
-                    result = session.post(url, json=payload, timeout=30)
-
         if result.status_code in (200, 201):
             return result.json()
 
@@ -158,3 +166,119 @@ def create_fulfillment(
     raise RuntimeError(
         f"Não foi possível criar fulfillment para o pedido {order_id}"
     )
+
+# ==================================================
+# ✏️ ATUALIZAR RASTREIO DE UM FULFILLMENT EXISTENTE
+# ==================================================
+def update_fulfillment_tracking(
+    fulfillment_id: int,
+    tracking_number: str,
+    tracking_company: str = "Correios",
+    notify_customer: bool = False,
+):
+    session = _get_session()
+    base_url, _ = _get_config()
+
+    url = f"{base_url}/fulfillments/{fulfillment_id}/update_tracking.json"
+
+    payload = {
+        "fulfillment": {
+            "tracking_number": tracking_number,
+            "tracking_company": tracking_company,
+            "notify_customer": notify_customer,
+        }
+    }
+
+    resp = session.post(url, json=payload, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def encontrar_fulfillment_por_rastreio(order: dict, rastreio_atual: str):
+    """
+    Procura o fulfillment que já possui o rastreio atual.
+    """
+    if not order or not rastreio_atual:
+        return None
+
+    for f in order.get("fulfillments", []):
+        tracking_numbers = f.get("tracking_numbers") or []
+        if rastreio_atual in tracking_numbers:
+            return f
+
+    return None
+
+# ==================================================
+# ❌ CANCELAR FULFILLMENT (DSERS)
+# ==================================================
+def cancelar_fulfillment(fulfillment_id: int):
+    session = _get_session()
+    base_url, _ = _get_config()
+
+    url = f"{base_url}/fulfillments/{fulfillment_id}/cancel.json"
+
+    resp = session.post(url, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+def get_fulfillment_orders(order_id: int):
+    session = _get_session()
+    base_url, _ = _get_config()
+
+    url = f"{base_url}/orders/{order_id}/fulfillment_orders.json"
+    resp = session.get(url, timeout=30)
+    resp.raise_for_status()
+
+    return resp.json().get("fulfillment_orders", [])
+
+def aplicar_rastreio_inteligente(order, rastreio):
+    """
+    Atualiza rastreio de forma segura:
+    - Manual → atualiza
+    - DSers / outro → cancela e recria
+    """
+    # tenta achar fulfillment pelo rastreio atual (se houver)
+    fulfillments = order.get("fulfillments", [])
+
+    fulfillment = next(
+        (f for f in reversed(fulfillments) if f.get("status") != "cancelled"),
+        None
+    )
+
+    if not fulfillment:
+        raise RuntimeError("Nenhum fulfillment encontrado")
+
+    if fulfillment.get("service") != "manual":
+        # 🔁 DSers / automático
+        cancelar_fulfillment(fulfillment["id"])
+
+        fulfillment_orders = []
+        for _ in range(5):
+            fulfillment_orders = get_fulfillment_orders(order["id"])
+            if fulfillment_orders:
+                break
+            time.sleep(1)
+
+        fo = next(
+            (f for f in fulfillment_orders if f["status"] == "open"),
+            None
+        )
+
+        if not fo:
+            raise RuntimeError("Nenhum fulfillment_order aberto")
+
+        create_fulfillment(
+            order_id=order["id"],
+            tracking_number=rastreio,
+            tracking_company="Correios",
+            notify_customer=False
+        )
+
+    else:
+        # ✏️ Manual → atualiza direto
+        update_fulfillment_tracking(
+            fulfillment_id=fulfillment["id"],
+            tracking_number=rastreio,
+            tracking_company="Correios",
+            notify_customer=False
+        )
