@@ -60,6 +60,7 @@ def rodar_rastreamento_para_aba(nome_aba: str):
     global sheet, header
     global COL_LINK, COL_OBS, COL_STATUS_LOG
     global COL_DATA_EVENTO, COL_HASH, COL_ULTIMA_LEITURA, COL_RISCO, COL_FRETE
+    global index_por_pedido
 
     log(f"\n🔄 Iniciando rastreamento da aba: {nome_aba}")
 
@@ -80,17 +81,28 @@ def rodar_rastreamento_para_aba(nome_aba: str):
     COL_ULTIMA_LEITURA = col("DATA DA ÚLTIMA LEITURA")
     COL_RISCO = col("RISCO LOGÍSTICO")
     COL_FRETE = col("FRETE")
+    COL_PEDIDO = header.index("PEDIDO")
 
+    # 🔒 Snapshot da planilha
     dados = sheet.get_all_values()
     linhas = dados[1:]
 
-    log(f"📦 Total de linhas: {len(linhas)}")
+    # 🔒 Índice estável por pedido
+    index_por_pedido = {}
+    for i, row in enumerate(linhas, start=2):
+        if len(row) > COL_PEDIDO:
+            pedido = str(row[COL_PEDIDO]).strip()
+            if pedido:
+                index_por_pedido[pedido] = i
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [
-            executor.submit(processar_linha, idx, row)
-            for idx, row in enumerate(linhas, start=2)
-        ]
+        futures = []
+        for row in linhas:
+            pedido = str(row[COL_PEDIDO]).strip()
+            if pedido:
+                futures.append(
+                    executor.submit(processar_linha, pedido, row)
+                )
 
         for i, _ in enumerate(as_completed(futures), start=1):
             if i % BATCH_SIZE == 0:
@@ -153,16 +165,31 @@ client = get_gspread_client()
 # REGRA DE NEGÓCIO — IMPORTAÇÃO
 # ==================================================
 
-IMPORTACAO_FALHA_FINAL = [
+FALHA_DEVOLUCAO = [
+    "devolução",
+    "devolucao",
+    "retorno",
+    "pacote devolvido",
+    "objeto devolvido",
+    "entregue ao remetente",
+    "objeto entregue ao remetente",
+    "assinada [devolução]",
+    "[devolução]",
+    "return",
+    "reverse",
+]
+
+FALHA_IMPORTACAO = [
     "importação não autorizada",
     "pedido não autorizado",
     "devolução determinada pela autoridade competente",
-    "devolução determinada pela autoridade",
-    "objeto devolvido ao remetente",
-    "pacote destruído",
-    "objeto destruído",
     "falha ao limpar na importação",
     "retido pela alfândega",
+]
+
+FALHA_DESTRUIDO = [
+    "pacote destruído",
+    "objeto destruído",
 ]
 
 # ==================================================
@@ -174,12 +201,57 @@ def get_text(parent, cls):
     except Exception:
         return ""
 
+def eh_entregue_valido(texto: str) -> bool:
+    texto = (texto or "").lower()
 
-def detectar_falha_importacao(texto_eventos: str) -> str:
-    for termo in IMPORTACAO_FALHA_FINAL:
-        if termo in texto_eventos:
-            return termo
-    return ""
+    positivos = [
+        "entregue ao destinatário",
+        "objeto entregue ao destinatário",
+        "entrega realizada com sucesso",
+        "recebido pelo destinatário",
+    ]
+
+    negativos = [
+        "remetente",
+        "devolvido",
+        "devolução",
+        "devolucao",
+        "retorno",
+        "return",
+        "reverse",
+        "assinatura falhou",
+        "tentativa",
+        "parcial",
+    ]
+
+    # precisa ter positivo forte
+    if not any(p in texto for p in positivos):
+        return False
+
+    # não pode ter nenhum negativo
+    if any(n in texto for n in negativos):
+        return False
+
+    return True
+
+
+def detectar_tipo_falha(texto_eventos: str):
+    texto = normalizar_texto(texto_eventos)
+
+    for termo in FALHA_DEVOLUCAO:
+        if normalizar_texto(termo) in texto:
+            return "DEVOLUÇÃO", termo
+
+    for termo in FALHA_IMPORTACAO:
+        if normalizar_texto(termo) in texto:
+            return "IMPORTAÇÃO", termo
+
+    for termo in FALHA_DESTRUIDO:
+        if normalizar_texto(termo) in texto:
+            return "DESTRUIDO", termo
+
+    return None, ""
+
 
 def normalizar_frete(frete_raw: str) -> str:
     texto = (frete_raw or "").upper()
@@ -350,37 +422,40 @@ def deve_rastrear(status_salvo, obs_atual, link):
     return True, "rastrear"
 
 def resolver_status_logistico(eventos):
-    """
-    REGRA-MÃE:
-    1) Evento final em QUALQUER ponto do histórico → FALHA
-    2) Senão → último evento decide
-    """
+    texto_historico = normalizar_texto(
+        " ".join(ev.text for ev in eventos)
+    )
 
-    # texto completo do histórico
-    texto_historico = " ".join(ev.text.lower() for ev in eventos)
+    # 1️⃣ Histórico manda
+    tipo_falha, motivo_falha = detectar_tipo_falha(texto_historico)
+    if tipo_falha:
+        return "FALHA", f"{tipo_falha} | {motivo_falha}"
 
-    motivo_falha = detectar_falha_importacao(texto_historico)
-    if motivo_falha:
-        return "FALHA", motivo_falha
 
-    # último evento
+    # 2️⃣ Último evento
     ultimo = eventos[0].find_element(By.CLASS_NAME, "rptn-order-tracking-text")
     texto_ultimo = (ultimo.text or "").lower()
 
-    if "entregue" in texto_ultimo:
+    if eh_entregue_valido(texto_historico):
         return "ENTREGUE", ""
 
     if any(p in texto_ultimo for p in [
         "aguardando retirada",
         "objeto disponível para retirada",
         "disponível para retirada",
-        "aguardando retirada pelo destinatário",
     ]):
         return "AGUARDANDO RETIRADA", ""
 
     return "EM TRÂNSITO", ""
 
-def processar_linha(idx, row):
+
+def processar_linha(pedido, row):
+    row_atual = index_por_pedido.get(str(pedido).strip())
+
+    if not row_atual:
+        log(f"⚠️ Pedido {pedido} não encontrado (linha mudou)")
+        return
+
     COL_DATA_PEDIDO = header.index("DATA") + 1 if "DATA" in header else None
     data_pedido = row[COL_DATA_PEDIDO - 1] if COL_DATA_PEDIDO and len(row) >= COL_DATA_PEDIDO else ""
 
@@ -397,15 +472,11 @@ def processar_linha(idx, row):
 
     agora_str = datetime.now(ZoneInfo("America/Sao_Paulo")).replace(microsecond=0).isoformat()
 
-    log(f"➡️ Linha {idx} | Status atual: {status_salvo or '—'}")
-
-    # ==================================================
-    # DECISÃO CENTRALIZADA DE RASTREIO
-    # ==================================================
+    log(f"➡️ Pedido {pedido} | Linha {row_atual} | Status atual: {status_salvo or '—'}")
     rastrear, motivo = deve_rastrear(status_salvo, obs_atual, link)
 
     if not rastrear:
-        log(f"⏭️ Linha {idx} ignorada ({motivo})")
+        log(f"⏭️ Linha {row_atual} ignorada ({motivo})")
 
         risco_atual = calcular_risco(
             status_salvo,
@@ -414,10 +485,10 @@ def processar_linha(idx, row):
             frete
         )
 
-        add_update(idx, COL_RISCO, risco_atual)
+        add_update(row_atual, COL_RISCO, risco_atual)
 
         if motivo == "link inválido":
-            add_update(idx, COL_OBS, "⚠️ Link inválido ou vazio")
+            add_update(row_atual, COL_OBS, "⚠️ Link inválido ou vazio")
 
         return
 
@@ -425,7 +496,7 @@ def processar_linha(idx, row):
     # ✅ Sempre marca que o sistema olhou
     ultima_salva = row[COL_ULTIMA_LEITURA - 1] if len(row) >= COL_ULTIMA_LEITURA else ""
 
-    add_update(idx, COL_ULTIMA_LEITURA, agora_str)
+    add_update(row_atual, COL_ULTIMA_LEITURA, agora_str)
     driver, wait = get_driver()
 
     try:
@@ -441,9 +512,9 @@ def processar_linha(idx, row):
         eventos = driver.find_elements(By.CLASS_NAME, "rptn-order-tracking-event")
 
         if not eventos:
-            add_update(idx, COL_STATUS_LOG, "ERRO")
-            add_update(idx, COL_OBS, "❌ ERRO DE RASTREAMENTO — Nenhum evento encontrado")
-            add_update(idx, COL_RISCO, "CRÍTICO")
+            add_update(row_atual, COL_STATUS_LOG, "ERRO")
+            add_update(row_atual, COL_OBS, "❌ ERRO DE RASTREAMENTO — Nenhum evento encontrado")
+            add_update(row_atual, COL_RISCO, "CRÍTICO")
             return
 
         status_novo, motivo_falha = resolver_status_logistico(eventos)
@@ -468,8 +539,6 @@ def processar_linha(idx, row):
             frete
         )
 
-
-        # ✅ Texto humano (OBSERVAÇÕES)
         if motivo_falha:
             texto_obs = " | ".join(p for p in [
                 "🚨 EVENTO FINAL NO HISTÓRICO — PEDIDO NÃO SERÁ ENTREGUE",
@@ -493,24 +562,23 @@ def processar_linha(idx, row):
         # ==================================================
         if (hash_salvo or "").strip() == (hash_novo or "").strip():
             # Não mudou: só atualiza risco (e última leitura já foi atualizada acima)
-            add_update(idx, COL_RISCO, risco_novo)
+            add_update(row_atual, COL_RISCO, risco_novo)
             return
 
         # Mudou: grava tudo
-        add_update(idx, COL_OBS, texto_obs)
-        add_update(idx, COL_STATUS_LOG, status_novo)
-        add_update(idx, COL_DATA_EVENTO, data)
-        add_update(idx, COL_HASH, hash_novo)
-        add_update(idx, COL_RISCO, risco_novo)
+        add_update(row_atual, COL_OBS, texto_obs)
+        add_update(row_atual, COL_STATUS_LOG, status_novo)
+        add_update(row_atual, COL_DATA_EVENTO, data)
+        add_update(row_atual, COL_HASH, hash_novo)
+        add_update(row_atual, COL_RISCO, risco_novo)
 
     except Exception as e:
-        log(f"❌ Erro linha {idx}: {e}")
+        log(f"❌ Erro linha {row_atual}: {e}")
 
-        add_update(idx, COL_STATUS_LOG, "ERRO")
-        add_update(idx, COL_OBS, "❌ ERRO TÉCNICO — Falha ao consultar rastreio. Reprocessar manualmente.")
+        add_update(row_atual, COL_STATUS_LOG, "ERRO")
+        add_update(row_atual, COL_OBS, "❌ ERRO TÉCNICO — Falha ao consultar rastreio. Reprocessar manualmente.")
+        add_update(row_atual, COL_RISCO, "CRÍTICO")
 
-        # erro técnico também é considerado pedido travado
-        add_update(idx, COL_RISCO, "CRÍTICO")
 
 if __name__ == "__main__":
     for aba in ABAS_RASTREAVEIS:
