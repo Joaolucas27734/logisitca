@@ -249,6 +249,7 @@ def load_reenvios():
     rows = values[1:]
 
     df = pd.DataFrame(rows, columns=headers)
+    df["ROW_NUMBER"] = range(2, len(rows) + 2)
 
     for col in colunas_padrao:
         if col not in df.columns:
